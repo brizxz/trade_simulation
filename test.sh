@@ -1,0 +1,14 @@
+python trade.py \
+  --symbol INTC \
+  --start_date 2024-03-13 \
+  --end_date 2025-04-11 \
+  --interval 5min \
+  --initial_capital 10000 \
+  --ma_short 10 \
+  --ma_long 30 \
+  --adx_threshold 25 \
+  --trade_unit 200 \
+  --max_units 1000 \
+  --stop_loss_pct 0.03 \
+  --cost_factor 0.001 \
+  --cooldown_period 1

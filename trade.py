@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Enhanced Intraday Trading Backtest System with Cash Account Simulation
+Strategy: Moving Average Crossover with Scaling (Intraday)
+Uses Alpha Vantage for data download.
+Improvements in this version:
+1. Do NOT force daily liquidation; holdings can be carried over to the next day.
+2. Use cash account simulation: track cash, position, and average cost.
+3. When sell signal or stop-loss is triggered, liquidate the entire position.
+4. Calculate portfolio value as: cash + (position * current price).
+5. Daily profit and return are computed based on portfolio value at the end of day.
+6. Command line argument support for configuring backtest parameters.
+"""
+
+from alpha_vantage.timeseries import TimeSeries # Import Alpha Vantage
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+import logging
+import sys
+import time
+import argparse
+from typing import Dict, Tuple, Optional, List, Any
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("trading_backtest.log", mode='w', encoding='utf-8')
+    ]
+)
+
+def parse_arguments():
+    """Parse command line arguments for configuring the backtest"""
+    parser = argparse.ArgumentParser(description='Intraday Trading Backtest System')
+    
+    # Required arguments
+    parser.add_argument('--symbol', type=str, required=True,
+                      help='Stock symbol (e.g., AAPL, MSFT, INTC)')
+    parser.add_argument('--start_date', type=str, required=True,
+                      help='Start date in YYYY-MM-DD format')
+    parser.add_argument('--end_date', type=str, required=True,
+                      help='End date in YYYY-MM-DD format')
+    
+    # Optional arguments with defaults
+    parser.add_argument('--interval', type=str, default='5min',
+                      help='Trading interval (1min, 5min, 15min, 30min, 60min)')
+    parser.add_argument('--initial_capital', type=float, default=10000.0,
+                      help='Initial capital in USD')
+    parser.add_argument('--api_key', type=str, default='CPSVFU8571VH65E3',
+                      help='Alpha Vantage API key')
+    
+    # Strategy selection
+    parser.add_argument('--strategy', type=str, default='ma_crossover',
+                      choices=['ma_crossover', 'rsi_reversal', 'breakout'],
+                      help='Trading strategy to use')
+    
+    # Strategy specific parameters
+    parser.add_argument('--ma_short', type=int, default=10,
+                      help='Short moving average period')
+    parser.add_argument('--ma_long', type=int, default=30,
+                      help='Long moving average period')
+    parser.add_argument('--adx_threshold', type=float, default=25.0,
+                      help='ADX threshold for trend strength')
+    parser.add_argument('--trade_unit', type=int, default=2,
+                      help='Base trade unit size')
+    parser.add_argument('--max_units', type=int, default=10,
+                      help='Maximum position size in units')
+    parser.add_argument('--stop_loss_pct', type=float, default=0.03,
+                      help='Stop loss percentage (0.03 = 3%)')
+    parser.add_argument('--cost_factor', type=float, default=0.001,
+                      help='Transaction cost factor (0.001 = 0.1%)')
+    parser.add_argument('--cooldown_period', type=int, default=1,
+                      help='Cooldown period after a trade in bars')
+    
+    # Breakout strategy parameters
+    parser.add_argument('--breakout_period', type=int, default=20,
+                      help='Lookback period for breakout strategy')
+    parser.add_argument('--breakout_threshold', type=float, default=0.02,
+                      help='Breakout threshold as percentage (0.02 = 2%)')
+    
+    # RSI strategy parameters
+    parser.add_argument('--rsi_period', type=int, default=14,
+                      help='Period for RSI calculation')
+    parser.add_argument('--rsi_overbought', type=int, default=70,
+                      help='RSI overbought threshold')
+    parser.add_argument('--rsi_oversold', type=int, default=30,
+                      help='RSI oversold threshold')
+    
+    return parser.parse_args()
+
+# -------------------------------
+# Technical Indicator Functions
+# -------------------------------
+def compute_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
+    high_low = data['High'] - data['Low']
+    high_close = np.abs(data['High'] - data['Close'].shift())
+    low_close = np.abs(data['Low'] - data['Close'].shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = true_range.rolling(window=period, min_periods=1).mean()
+    return atr
+
+def compute_adx(data: pd.DataFrame, period: int = 14) -> pd.Series:
+    up_move = data['High'] - data['High'].shift()
+    down_move = data['Low'].shift() - data['Low']
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = pd.concat([
+        data['High'] - data['Low'],
+        np.abs(data['High'] - data['Close'].shift()),
+        np.abs(data['Low'] - data['Close'].shift())
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=1).mean()
+    plus_dm_series = pd.Series(np.array(plus_dm).flatten(), index=data.index)
+    minus_dm_series = pd.Series(np.array(minus_dm).flatten(), index=data.index)
+    plus_di = 100 * (plus_dm_series.rolling(window=period, min_periods=1).sum() / atr)
+    minus_di = 100 * (minus_dm_series.rolling(window=period, min_periods=1).sum() / atr)
+    dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = dx.rolling(window=period, min_periods=1).mean()
+    return adx
+
+def compute_rsi(data: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Relative Strength Index"""
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    
+    # Calculate RS
+    rs = gain / loss
+    # Calculate RSI
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# -------------------------------
+# Core Strategy Functions
+# -------------------------------
+def download_data_alpha_vantage(symbol: str, start_date: str, end_date: str, 
+                                interval: str = "5min", api_key: str = 'CPSVFU8571VH65E3', 
+                                max_retries: int = 5) -> pd.DataFrame:
+    """
+    Downloads intraday data from Alpha Vantage.
+    Handles interval mapping, column renaming, date filtering, and retries.
+    """
+    # Validate dates before proceeding
+    try:
+        start_date_obj = datetime.datetime.strptime(start_date, '%Y-%m-%d')
+        end_date_obj = datetime.datetime.strptime(end_date, '%Y-%m-%d')
+        
+        # Convert validated dates back to string format
+        start_date = start_date_obj.strftime('%Y-%m-%d')
+        end_date = end_date_obj.strftime('%Y-%m-%d')
+        
+        logging.info(f"Using validated date range: {start_date} to {end_date}")
+    except ValueError as e:
+        logging.error(f"Invalid date format: {e}")
+        return pd.DataFrame()
+    
+    # Map requested interval to Alpha Vantage supported intervals
+    # Free tier supports: '1min', '5min', '15min', '30min', '60min'
+    av_interval = interval
+    if interval == "2m":
+        av_interval = "5min" # Map 2m to 5min for free tier
+        logging.warning(f"Interval '2m' not directly supported by Alpha Vantage free tier. Using '{av_interval}'.")
+    elif interval not in ['1min', '5min', '15min', '30min', '60min']:
+        logging.error(f"Unsupported interval '{interval}' for Alpha Vantage. Using default '5min'.")
+        av_interval = "5min"
+        
+    logging.info(f"Downloading {symbol} data from Alpha Vantage ({av_interval} interval)...")
+    
+    ts = TimeSeries(key=api_key, output_format='pandas')
+    output_size = 'full' # Request 'full' to get more historical data, then filter
+
+    for retry in range(max_retries):
+        try:
+            # Alpha Vantage Free tier limit: 5 calls per minute. Wait >12 seconds.
+            # Add increasing wait time for retries.
+            wait_time = 15 + (retry * 10) # Start with 15s, then 25s, 35s...
+            if retry > 0:
+                 logging.info(f"Waiting {wait_time} seconds before retrying ({retry+1}/{max_retries})...")
+                 time.sleep(wait_time)
+            else:
+                # Small initial delay even for the first attempt
+                time.sleep(1) 
+
+            logging.info(f"Attempting Alpha Vantage download ({retry+1}/{max_retries})...")
+            data, meta_data = ts.get_intraday(symbol=symbol, interval=av_interval, outputsize=output_size)
+            
+            # Rename columns
+            data.rename(columns={
+                '1. open': 'Open', 
+                '2. high': 'High', 
+                '3. low': 'Low', 
+                '4. close': 'Close', 
+                '5. volume': 'Volume'
+            }, inplace=True)
+            
+            # Convert index to datetime and sort
+            data.index = pd.to_datetime(data.index)
+            data.sort_index(inplace=True)
+            
+            # Log data info
+            logging.info(f"Raw data received from Alpha Vantage (before date filtering):")
+            if not data.empty:
+                logging.info(f"Raw data head:\n{data.head()}")
+                logging.info(f"Raw data tail:\n{data.tail()}")
+                logging.info(f"Raw data index range: {data.index.min()} to {data.index.max()}")
+            else:
+                logging.warning("Alpha Vantage returned an empty DataFrame BEFORE filtering.")
+            
+            # Filter data by requested date range
+            logging.info(f"Filtering data between {start_date} and {end_date}...")
+            data = data.loc[start_date:end_date]
+            logging.info(f"Data shape after filtering: {data.shape}") # Log shape after filtering
+            
+            if not data.empty:
+                data.dropna(inplace=True) # Drop any NaNs after processing
+                logging.info("Alpha Vantage data download and processing successful.")
+                return data
+            else:
+                # Refined warning message
+                logging.warning(f"Data became empty AFTER filtering for the range {start_date} to {end_date}.")
+                # Don't retry if filtering results in empty. If AV returned empty before filtering, we also stop.
+                return pd.DataFrame() 
+
+        except ValueError as ve:
+             # Catch potential errors from alpha_vantage library (e.g., invalid API key, API limit)
+             logging.error(f"Alpha Vantage API Error: {ve}. Check API key or usage limits.")
+             # If it's a known API error, maybe stop retrying early? For now, continue retrying.
+             if "call frequency" in str(ve).lower():
+                 logging.warning("Rate limit likely hit.")
+             elif "invalid api key" in str(ve).lower():
+                  logging.error("Invalid Alpha Vantage API Key provided.")
+                  return pd.DataFrame() # Stop retrying if key is invalid
+        except Exception as e:
+            logging.warning(f"Download failed: {e}. Retrying ({retry+1}/{max_retries})...")
+
+    logging.error(f"Alpha Vantage data download failed after {max_retries} retries.")
+    return pd.DataFrame()
+
+def calculate_indicators(data: pd.DataFrame, ma_short: int = 10, ma_long: int = 30, 
+                         rsi_period: int = 14, breakout_period: int = 20) -> pd.DataFrame:
+    """Calculate technical indicators for the trading strategy"""
+    logging.info(f"Calculating indicators...")
+    
+    # Moving averages for MA Crossover strategy
+    data[f'MA_{ma_short}'] = data['Close'].rolling(window=ma_short).mean()
+    data[f'MA_{ma_long}'] = data['Close'].rolling(window=ma_long).mean()
+    
+    # ATR and ADX for volatility and trend strength
+    data['ATR'] = compute_atr(data, period=14)
+    data['ADX'] = compute_adx(data, period=14)
+    
+    # RSI for RSI Reversal strategy
+    data['RSI'] = compute_rsi(data, period=rsi_period)
+    
+    # Breakout levels for Breakout strategy
+    data['Upper_Band'] = data['Close'].rolling(window=breakout_period).max()
+    data['Lower_Band'] = data['Close'].rolling(window=breakout_period).min()
+    
+    data.dropna(inplace=True)
+    return data
+
+def generate_ma_crossover_signals(data: pd.DataFrame, ma_short: int = 10, 
+                                  ma_long: int = 30, adx_threshold: float = 25) -> pd.DataFrame:
+    """Generate trading signals based on MA crossover with ADX filter"""
+    logging.info("Generating MA Crossover signals with ADX filter...")
+    ma_short_col = f'MA_{ma_short}'
+    ma_long_col = f'MA_{ma_long}'
+    data['Signal'] = 0
+    # Buy signal: MA crossover and ADX > threshold
+    buy_signal = ((data[ma_short_col] > data[ma_long_col]) & 
+                  (data[ma_short_col].shift(1) <= data[ma_long_col].shift(1)) &
+                  (data['ADX'] > adx_threshold))
+    # Sell signal: MA crossover
+    sell_signal = (data[ma_short_col] < data[ma_long_col]) & (data[ma_short_col].shift(1) >= data[ma_long_col].shift(1))
+    data.loc[buy_signal, 'Signal'] = 1
+    data.loc[sell_signal, 'Signal'] = -1
+    return data
+
+def generate_rsi_reversal_signals(data: pd.DataFrame, rsi_period: int = 14, 
+                                 rsi_oversold: int = 30, rsi_overbought: int = 70) -> pd.DataFrame:
+    """Generate trading signals based on RSI reversals"""
+    logging.info("Generating RSI Reversal trading signals...")
+    data['Signal'] = 0
+    
+    # Buy signal: RSI crosses above oversold threshold
+    buy_signal = (data['RSI'] > rsi_oversold) & (data['RSI'].shift(1) <= rsi_oversold)
+    
+    # Sell signal: RSI crosses below overbought threshold
+    sell_signal = (data['RSI'] < rsi_overbought) & (data['RSI'].shift(1) >= rsi_overbought)
+    
+    data.loc[buy_signal, 'Signal'] = 1
+    data.loc[sell_signal, 'Signal'] = -1
+    
+    return data
+
+def generate_breakout_signals(data: pd.DataFrame, breakout_period: int = 20, 
+                             breakout_threshold: float = 0.02) -> pd.DataFrame:
+    """Generate trading signals based on price breakouts"""
+    logging.info("Generating Breakout trading signals...")
+    data['Signal'] = 0
+    
+    # Calculate percentage distance from bands
+    data['Upper_Distance'] = (data['Close'] - data['Upper_Band']) / data['Upper_Band']
+    data['Lower_Distance'] = (data['Lower_Band'] - data['Close']) / data['Lower_Band']
+    
+    # Buy signal: Price breaks above upper band by threshold percentage
+    buy_signal = data['Upper_Distance'] > breakout_threshold
+    
+    # Sell signal: Price breaks below lower band by threshold percentage
+    sell_signal = data['Lower_Distance'] > breakout_threshold
+    
+    data.loc[buy_signal, 'Signal'] = 1
+    data.loc[sell_signal, 'Signal'] = -1
+    
+    return data
+
+def generate_signals(data: pd.DataFrame, strategy: str = 'ma_crossover', **params) -> pd.DataFrame:
+    """Generate trading signals based on selected strategy"""
+    if strategy == 'ma_crossover':
+        return generate_ma_crossover_signals(
+            data, 
+            ma_short=params.get('ma_short', 10), 
+            ma_long=params.get('ma_long', 30), 
+            adx_threshold=params.get('adx_threshold', 25)
+        )
+    elif strategy == 'rsi_reversal':
+        return generate_rsi_reversal_signals(
+            data,
+            rsi_period=params.get('rsi_period', 14),
+            rsi_oversold=params.get('rsi_oversold', 30),
+            rsi_overbought=params.get('rsi_overbought', 70)
+        )
+    elif strategy == 'breakout':
+        return generate_breakout_signals(
+            data,
+            breakout_period=params.get('breakout_period', 20),
+            breakout_threshold=params.get('breakout_threshold', 0.02)
+        )
+    else:
+        logging.warning(f"Unknown strategy '{strategy}', defaulting to MA Crossover")
+        return generate_ma_crossover_signals(data)
+
+def simulate_trading_with_cash(data: pd.DataFrame, initial_capital: float, 
+                                trade_unit: int = 2, max_units: int = 10,
+                                stop_loss_pct: float = 0.03, cost_factor: float = 0.001, 
+                                cooldown_period: int = 1) -> pd.DataFrame:
+    """
+    Simulate intraday trading with cash account.
+    Instead of forced daily liquidation, holdings are carried over.
+    - Maintain variables: cash, position, average_cost.
+    - On a buy signal (Signal==1) and if cooldown==0, buy trade_unit shares (if position < max_units).
+      Update cash and average cost.
+    - On a sell signal (Signal==-1) or stop-loss condition, sell all shares.
+    - Deduct transaction cost per trade.
+    - After a trade, impose a cooldown period (skip next N bars).
+    - Record portfolio value = cash + position * current price.
+    """
+    logging.info("Simulating trading with cash account...")
+    cash = initial_capital
+    position = 0
+    average_cost = 0.0
+    cooldown = 0
+    portfolio_values = []  # record portfolio value at each bar
+    # For each bar, update the cash account simulation
+    # We'll also record a new column for portfolio value.
+    portfolio_value_list = []
+    scaled_positions = []
+    trade_costs = []
+    avg_cost_list = []
+    
+    for idx, row in data.iterrows():
+        # Convert to scalar
+        try:
+            signal = row['Signal'].item()
+        except AttributeError:
+            signal = row['Signal']
+        try:
+            price = row['Close'].item()
+        except AttributeError:
+            price = row['Close']
+        
+        cost = 0.0
+
+        if cooldown > 0:
+            cooldown -= 1
+            # Check stop loss during cooldown
+            if position > 0 and price < average_cost * (1 - stop_loss_pct):
+                # Sell all shares
+                proceeds = position * price
+                cost = proceeds * cost_factor
+                cash += proceeds - cost
+                position = 0
+                average_cost = 0.0
+                cooldown = cooldown_period
+        else:
+            if signal == 1:
+                # Buy signal: if position < max_units, buy trade_unit shares
+                if position < max_units:
+                    shares_to_buy = trade_unit
+                    cost_to_buy = shares_to_buy * price
+                    transaction_cost = cost_to_buy * cost_factor
+                    # Check if sufficient cash available (for simplicity assume always enough cash)
+                    cash -= (cost_to_buy + transaction_cost)
+                    # Update average cost
+                    total_cost = position * average_cost + cost_to_buy
+                    position += shares_to_buy
+                    average_cost = total_cost / position
+                    cost = transaction_cost
+                    cooldown = cooldown_period
+            elif signal == -1:
+                # Sell signal: if holding shares, sell all
+                if position > 0:
+                    proceeds = position * price
+                    transaction_cost = proceeds * cost_factor
+                    cash += proceeds - transaction_cost
+                    position = 0
+                    average_cost = 0.0
+                    cost = transaction_cost
+                    cooldown = cooldown_period
+            # Also, if stop loss is triggered during normal processing
+            if position > 0 and price < average_cost * (1 - stop_loss_pct):
+                proceeds = position * price
+                transaction_cost = proceeds * cost_factor
+                cash += proceeds - transaction_cost
+                position = 0
+                average_cost = 0.0
+                cost = transaction_cost
+                cooldown = cooldown_period
+
+        scaled_positions.append(position)
+        trade_costs.append(cost)
+        avg_cost_list.append(average_cost)
+        # Portfolio value = cash + (position * current price)
+        current_value = cash + position * price
+        portfolio_value_list.append(current_value)
+
+    data['Cash'] = pd.Series(index=data.index, data=[np.nan]*len(data))
+    data['Position'] = scaled_positions
+    data['Avg_Cost'] = avg_cost_list
+    data['Trade_Cost'] = trade_costs
+    data['Portfolio_Value'] = portfolio_value_list
+    # Calculate intraday returns based on portfolio value changes
+    data['Return'] = data['Portfolio_Value'].pct_change()
+    # For strategy return, we can use portfolio value change (realized P&L) difference
+    data['Strategy_Return'] = data['Return'].fillna(0)
+    data['Cumulative_Strategy_Return'] = (1 + data['Strategy_Return']).cumprod()
+    # Market return from close price
+    data['Market_Return'] = data['Close'].pct_change().fillna(0)
+    data['Cumulative_Market_Return'] = (1 + data['Market_Return']).cumprod()
+
+    return data
+
+def calculate_daily_capital(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate daily portfolio value evolution based on the portfolio value column.
+    """
+    logging.info("Calculating daily capital evolution...")
+    daily = data.groupby(data.index.date).last().copy()
+    daily.index = pd.to_datetime(daily.index)
+    daily.rename_axis("Date", inplace=True)
+    daily['Daily_Return'] = daily['Portfolio_Value'].pct_change()
+    daily['Daily_Profit'] = daily['Portfolio_Value'].diff()
+    return daily
+
+def calculate_performance_metrics(data: pd.DataFrame) -> dict:
+    """Calculate performance metrics for the trading strategy"""
+    logging.info("Calculating performance metrics...")
+    cum_strat = data['Cumulative_Strategy_Return']
+    running_max = cum_strat.cummax()
+    drawdown = (cum_strat - running_max) / running_max
+    max_drawdown = drawdown.min()
+
+    mean_return = data['Strategy_Return'].mean()
+    std_return = data['Strategy_Return'].std()
+    # Adjust Sharpe Ratio calculation for intraday data frequency
+    # Assuming ~252 trading days, and T is number of bars per day
+    # Example: 5-min interval => 390/5 = 78 bars/day approx.
+    bars_per_day = len(data.index.normalize().unique()) # Estimate bars per day from data
+    if bars_per_day == 0: bars_per_day = 1 # Avoid division by zero
+    annualization_factor = np.sqrt(252 * bars_per_day) 
+    
+    sharpe_ratio = (mean_return / std_return * annualization_factor) if std_return != 0 else np.nan
+
+    metrics = {
+        'max_drawdown': max_drawdown,
+        'sharpe_ratio': sharpe_ratio,
+        'total_return': (cum_strat.iloc[-1] - 1) * 100,  # Percentage total return
+        'daily_return_mean': mean_return * 100 * bars_per_day,  # Annualized daily mean return
+        'daily_return_std': std_return * 100 * np.sqrt(bars_per_day)  # Annualized daily std return
+    }
+    
+    logging.info(f"Max Drawdown: {max_drawdown:.2%}, Sharpe Ratio: {sharpe_ratio:.2f} (Annualized)")
+    logging.info(f"Total Return: {metrics['total_return']:.2f}%, Daily Return: {metrics['daily_return_mean']:.2f}% ± {metrics['daily_return_std']:.2f}%")
+    
+    return metrics
+
+def plot_results(data: pd.DataFrame, symbol: str, daily_capital: pd.DataFrame, strategy: str):
+    """Plot trading results and performance metrics"""
+    plt.style.use('ggplot')
+    fig, axs = plt.subplots(3, 1, figsize=(16, 18), gridspec_kw={'height_ratios': [3, 2, 2]})
+
+    # Format x-axis to show dates properly
+    import matplotlib.dates as mdates
+    date_format = mdates.DateFormatter('%Y-%m-%d')
+    
+    # Plot 1: Price and strategy indicators
+    axs[0].plot(data.index, data['Close'], label='Close Price', color='blue')
+    
+    # Add strategy-specific indicators
+    if strategy == 'ma_crossover':
+        if 'MA_10' in data.columns and 'MA_30' in data.columns:
+            axs[0].plot(data.index, data['MA_10'], label='MA(10)', color='orange')
+            axs[0].plot(data.index, data['MA_30'], label='MA(30)', color='magenta')
+    elif strategy == 'rsi_reversal':
+        # Add an additional axis for RSI
+        ax_rsi = axs[0].twinx()
+        ax_rsi.plot(data.index, data['RSI'], label='RSI', color='green', alpha=0.5)
+        ax_rsi.axhline(y=30, color='green', linestyle='--', alpha=0.3)
+        ax_rsi.axhline(y=70, color='red', linestyle='--', alpha=0.3)
+        ax_rsi.set_ylabel('RSI')
+        ax_rsi.legend(loc='upper right')
+    elif strategy == 'breakout':
+        axs[0].plot(data.index, data['Upper_Band'], label='Upper Band', color='green', linestyle='--')
+        axs[0].plot(data.index, data['Lower_Band'], label='Lower Band', color='red', linestyle='--')
+    
+    # Plot buy/sell signals
+    buy_signals = data[data['Signal'] == 1]
+    sell_signals = data[data['Signal'] == -1]
+    axs[0].scatter(buy_signals.index, buy_signals['Close'], marker='^', color='green', s=100, label='Buy Signal')
+    axs[0].scatter(sell_signals.index, sell_signals['Close'], marker='v', color='red', s=100, label='Sell Signal')
+    
+    # Format dates on x-axis
+    axs[0].xaxis.set_major_formatter(date_format)
+    axs[0].xaxis.set_major_locator(mdates.AutoDateLocator())
+    
+    axs[0].set_title(f"{symbol} Price & {strategy.replace('_', ' ').title()} Strategy Signals")
+    axs[0].set_ylabel("Price (USD)")
+    axs[0].legend(loc='upper left')
+
+    # Plot 2: Strategy vs Market Returns
+    axs[1].plot(data.index, data['Cumulative_Strategy_Return'], label='Strategy Return', color='green')
+    axs[1].plot(data.index, data['Cumulative_Market_Return'], label='Market Return', color='blue')
+    axs[1].xaxis.set_major_formatter(date_format)
+    axs[1].xaxis.set_major_locator(mdates.AutoDateLocator())
+    axs[1].set_title("Strategy Return vs. Market Return")
+    axs[1].set_ylabel("Cumulative Return")
+    axs[1].legend()
+
+    # Plot 3: Portfolio Value Evolution
+    axs[2].plot(daily_capital.index, daily_capital['Portfolio_Value'], marker='o', label='Portfolio Value', color='purple')
+    axs[2].xaxis.set_major_formatter(date_format)
+    axs[2].xaxis.set_major_locator(mdates.AutoDateLocator())
+    axs[2].set_title("Daily Portfolio Value Evolution")
+    axs[2].set_xlabel("Date")
+    axs[2].set_ylabel("Portfolio Value (USD)")
+    axs[2].legend()
+
+    # Rotate x-axis labels for better readability
+    for ax in axs:
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
+    plt.tight_layout()
+    plt.savefig(f"{symbol}_{strategy}_backtest_results.png")
+    plt.show()
+
+def display_portfolio_summary(data: pd.DataFrame, initial_capital: float):
+    """Display a summary of the portfolio's current state"""
+    if data.empty:
+        logging.error("Cannot display portfolio summary: empty data")
+        return
+    
+    # Get final values
+    final_row = data.iloc[-1]
+    final_portfolio_value = final_row['Portfolio_Value']
+    final_position = final_row['Position']
+    final_price = final_row['Close']
+    final_cash = final_portfolio_value - (final_position * final_price)
+    
+    # Calculate metrics
+    total_return_pct = ((final_portfolio_value / initial_capital) - 1) * 100
+    position_value = final_position * final_price
+    position_pct = (position_value / final_portfolio_value) * 100 if final_portfolio_value > 0 else 0
+    cash_pct = (final_cash / final_portfolio_value) * 100 if final_portfolio_value > 0 else 0
+    
+    # Create a summary table
+    summary = {
+        "Initial Capital": f"${initial_capital:.2f}",
+        "Final Portfolio Value": f"${final_portfolio_value:.2f}",
+        "Total Return": f"{total_return_pct:.2f}%",
+        "Final Cash": f"${final_cash:.2f} ({cash_pct:.1f}%)",
+        "Final Position": f"{final_position} shares (${position_value:.2f}, {position_pct:.1f}%)",
+        "Final Share Price": f"${final_price:.2f}"
+    }
+    
+    # Print summary
+    logging.info("\n" + "="*50)
+    logging.info("PORTFOLIO SUMMARY")
+    logging.info("="*50)
+    for key, value in summary.items():
+        logging.info(f"{key}: {value}")
+    logging.info("="*50)
+    
+    return summary
+
+def run_backtest(
+    symbol: str, 
+    start_date: str, 
+    end_date: str, 
+    interval: str = "5min", 
+    initial_capital: float = 10000.0,
+    strategy: str = 'ma_crossover',
+    ma_short: int = 10, 
+    ma_long: int = 30, 
+    adx_threshold: float = 25.0,
+    rsi_period: int = 14,
+    rsi_oversold: int = 30,
+    rsi_overbought: int = 70,
+    breakout_period: int = 20,
+    breakout_threshold: float = 0.02,
+    trade_unit: int = 2, 
+    max_units: int = 10, 
+    stop_loss_pct: float = 0.03, 
+    cost_factor: float = 0.001, 
+    cooldown_period: int = 1,
+    api_key: str = 'CPSVFU8571VH65E3'
+) -> Tuple[Dict, pd.DataFrame, pd.DataFrame, str]:
+    """
+    Run a complete backtest with the specified parameters and strategy
+    
+    Parameters:
+    -----------
+    symbol : str
+        Stock symbol (e.g., AAPL, MSFT, INTC)
+    start_date : str
+        Start date in YYYY-MM-DD format
+    end_date : str
+        End date in YYYY-MM-DD format
+    interval : str, optional
+        Trading interval (1min, 5min, 15min, 30min, 60min), by default "5min"
+    initial_capital : float, optional
+        Initial capital in USD, by default 10000.0
+    strategy : str, optional
+        Trading strategy to use (ma_crossover, rsi_reversal, breakout), by default 'ma_crossover'
+    ma_short : int, optional
+        Short moving average period, by default 10
+    ma_long : int, optional
+        Long moving average period, by default 30
+    adx_threshold : float, optional
+        ADX threshold for trend strength, by default 25.0
+    rsi_period : int, optional
+        Period for RSI calculation, by default 14
+    rsi_oversold : int, optional
+        RSI oversold threshold, by default 30
+    rsi_overbought : int, optional
+        RSI overbought threshold, by default 70
+    breakout_period : int, optional
+        Lookback period for breakout strategy, by default 20
+    breakout_threshold : float, optional
+        Breakout threshold as percentage, by default 0.02
+    trade_unit : int, optional
+        Base trade unit size, by default 2
+    max_units : int, optional
+        Maximum position size in units, by default 10
+    stop_loss_pct : float, optional
+        Stop loss percentage (0.03 = 3%), by default 0.03
+    cost_factor : float, optional
+        Transaction cost factor (0.001 = 0.1%), by default 0.001
+    cooldown_period : int, optional
+        Cooldown period after a trade in bars, by default 1
+    api_key : str, optional
+        Alpha Vantage API key, by default 'CPSVFU8571VH65E3'
+    
+    Returns:
+    --------
+    Tuple[Dict, pd.DataFrame, pd.DataFrame, str]
+        (performance_metrics, backtest_data, daily_capital, strategy)
+    """
+    # Download data
+    data = download_data_alpha_vantage(symbol, start_date, end_date, 
+                                     interval=interval, api_key=api_key)
+    
+    if data.empty:
+        logging.error("Unable to proceed with backtest due to data download failure.")
+        return None, None, None, None
+    
+    # Calculate indicators for all strategies
+    data = calculate_indicators(
+        data, 
+        ma_short=ma_short, 
+        ma_long=ma_long,
+        rsi_period=rsi_period,
+        breakout_period=breakout_period
+    )
+    
+    # Generate signals based on selected strategy
+    data = generate_signals(
+        data,
+        strategy=strategy,
+        ma_short=ma_short,
+        ma_long=ma_long,
+        adx_threshold=adx_threshold,
+        rsi_period=rsi_period,
+        rsi_oversold=rsi_oversold,
+        rsi_overbought=rsi_overbought,
+        breakout_period=breakout_period,
+        breakout_threshold=breakout_threshold
+    )
+    
+    # Simulate trading
+    data = simulate_trading_with_cash(
+        data, 
+        initial_capital=initial_capital, 
+        trade_unit=trade_unit,
+        max_units=max_units, 
+        stop_loss_pct=stop_loss_pct, 
+        cost_factor=cost_factor, 
+        cooldown_period=cooldown_period
+    )
+    
+    # Calculate performance
+    performance_metrics = calculate_performance_metrics(data)
+    daily_capital = calculate_daily_capital(data)
+
+    # Log results
+    logging.info(f"Strategy: {strategy}")
+    logging.info("Latest intraday backtest data (tail):")
+    columns_to_log = ['Close', 'Signal', 'Position', 'Portfolio_Value', 'Strategy_Return']
+    logging.info(data[columns_to_log].tail(10))
+    
+    logging.info("Daily Capital Evolution:")
+    logging.info(daily_capital[['Portfolio_Value', 'Daily_Profit', 'Daily_Return']].tail())
+    
+    # Display portfolio summary
+    display_portfolio_summary(data, initial_capital)
+    
+    return performance_metrics, data, daily_capital, strategy
+
+def main():
+    """Main function to run the backtest with command line arguments"""
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Import matplotlib for date formatting
+    import matplotlib.dates
+    
+    # Run backtest with arguments
+    performance_metrics, data, daily_capital, strategy = run_backtest(
+        symbol=args.symbol,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        interval=args.interval,
+        initial_capital=args.initial_capital,
+        strategy=args.strategy,
+        ma_short=args.ma_short,
+        ma_long=args.ma_long,
+        adx_threshold=args.adx_threshold,
+        rsi_period=args.rsi_period,
+        rsi_oversold=args.rsi_oversold,
+        rsi_overbought=args.rsi_overbought,
+        breakout_period=args.breakout_period,
+        breakout_threshold=args.breakout_threshold,
+        trade_unit=args.trade_unit,
+        max_units=args.max_units,
+        stop_loss_pct=args.stop_loss_pct,
+        cost_factor=args.cost_factor,
+        cooldown_period=args.cooldown_period,
+        api_key=args.api_key
+    )
+    
+    if performance_metrics is not None:
+        # Print summary
+        logging.info("Backtest completed successfully")
+        logging.info(f"Strategy: {args.strategy}")
+        logging.info("Strategy performance summary:")
+        for key, value in performance_metrics.items():
+            if key in ['max_drawdown']:
+                logging.info(f"  {key}: {value:.2%}")
+            else:
+                logging.info(f"  {key}: {value:.2f}")
+        
+        # Plot results
+        plot_results(data, args.symbol, daily_capital, args.strategy)
+    else:
+        logging.error("Backtest could not be completed.")
+
+if __name__ == '__main__':
+    main()
